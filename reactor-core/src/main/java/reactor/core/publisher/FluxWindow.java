@@ -158,6 +158,7 @@ final class FluxWindow<T> extends InternalFluxOperator<T, Flux<T>> {
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, actual.currentContext());
+				Operators.onDiscard(t, actual.currentContext());
 				return;
 			}
 
@@ -328,6 +329,7 @@ final class FluxWindow<T> extends InternalFluxOperator<T, Flux<T>> {
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, ctx);
+				Operators.onDiscard(t, ctx);
 				return;
 			}
 
@@ -534,6 +536,7 @@ final class FluxWindow<T> extends InternalFluxOperator<T, Flux<T>> {
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, actual.currentContext());
+				Operators.onDiscard(t, actual.currentContext());
 				return;
 			}
 

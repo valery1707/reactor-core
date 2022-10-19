@@ -347,6 +347,8 @@ final class SinkManyUnicast<T> extends Flux<T> implements InternalManySink<T>, D
 				else if (done) {
 					Operators.onNextDropped(dataSignalOfferedBeforeDrain,
 							currentContext());
+					Operators.onDiscard(dataSignalOfferedBeforeDrain,
+							currentContext());
 				}
 			}
 			return;

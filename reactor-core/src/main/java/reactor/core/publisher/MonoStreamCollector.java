@@ -108,6 +108,7 @@ final class MonoStreamCollector<T, A, R> extends MonoFromFluxOperator<T, R>
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, actual.currentContext());
+				Operators.onDiscard(t, actual.currentContext());
 				return;
 			}
 			try {

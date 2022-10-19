@@ -204,6 +204,7 @@ final class FluxTap<T, STATE> extends InternalFluxOperator<T, T> {
 				}
 				finally {
 					Operators.onNextDropped(t, currentContext());
+					Operators.onDiscard(t, currentContext());
 				}
 				return;
 			}

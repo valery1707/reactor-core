@@ -94,6 +94,7 @@ final class MonoElementAt<T> extends MonoFromFluxOperator<T, T>
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, actual.currentContext());
+				Operators.onDiscard(t, actual.currentContext());
 				return;
 			}
 

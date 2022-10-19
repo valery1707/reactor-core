@@ -70,6 +70,7 @@ final class MonoCollectList<T> extends MonoFromFluxOperator<T, List<T>> implemen
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, actual.currentContext());
+				Operators.onDiscard(t, actual.currentContext());
 				return;
 			}
 

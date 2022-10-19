@@ -62,6 +62,7 @@ final class MonoHasElement<T> extends InternalMonoOperator<T, Boolean> implement
 		public void onNext(T t) {
 			if (done) {
 				Operators.onNextDropped(t, currentContext());
+				Operators.onDiscard(t, currentContext());
 				return;
 			}
 

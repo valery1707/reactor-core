@@ -321,6 +321,7 @@ class NextProcessor<O> extends MonoProcessor<O> implements CoreSubscriber<O>, re
 					return;
 				case FAIL_TERMINATED:
 					Operators.onNextDropped(value, currentContext());
+					Operators.onDiscard(value, currentContext());
 					return;
 				case FAIL_NON_SERIALIZED:
 					throw new EmissionException(emitResult,
