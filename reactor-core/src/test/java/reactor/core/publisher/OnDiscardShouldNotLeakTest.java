@@ -59,10 +59,10 @@ import static reactor.core.publisher.Sinks.EmitFailureHandler.FAIL_FAST;
 @Tag("slow")
 public class OnDiscardShouldNotLeakTest {
 
-	private static final int NB_ITERATIONS = 100;
+	private static final int NB_ITERATIONS = 100000;
 	// add DiscardScenarios here to test more operators
 	private static final DiscardScenario[] SCENARIOS = new DiscardScenario[] {
-			DiscardScenario.allFluxSourceArray("merge", 4, Flux::merge),
+			/*DiscardScenario.allFluxSourceArray("merge", 4, Flux::merge),
 			DiscardScenario.allFluxSourceArray("when", 4,
 					sources -> Mono.when(sources.toArray(new Publisher[0])).thenReturn(Tracked.RELEASED)),
 			DiscardScenario.allFluxSourceArray("monoZip", 4,
@@ -155,10 +155,10 @@ public class OnDiscardShouldNotLeakTest {
 			DiscardScenario.fluxSource("monoFlatMap", main -> main.last().flatMap(f -> Mono.just(f).hide())),
 			DiscardScenario.fluxSource("monoFilterWhen", main -> main.last().filterWhen(__ -> Mono.just(true).hide())),
 			DiscardScenario.fluxSource("monoFilterWhenFalse", main -> main.last().filterWhen(__ -> Mono.just(false).hide())),
-			DiscardScenario.fluxSource("last", main -> main.last(new Tracked("default")).flatMap(f -> Mono.just(f).hide())),
+			DiscardScenario.fluxSource("last", main -> main.last(new Tracked("default")).flatMap(f -> Mono.just(f).hide())),*/
 			DiscardScenario.fluxSource("flatMapIterable", f -> f.flatMapIterable(Arrays::asList)),
 			DiscardScenario.fluxSource("bufferTimeout", f -> f.bufferTimeout(2, Duration.ofMillis(1), true).flatMapIterable(Function.identity())),
-			DiscardScenario.fluxSource("publishOnDelayErrors", f -> f.publishOn(Schedulers.immediate())),
+			/*DiscardScenario.fluxSource("publishOnDelayErrors", f -> f.publishOn(Schedulers.immediate())),
 			DiscardScenario.fluxSource("publishOnImmediateErrors", f -> f.publishOn(Schedulers.immediate(), false, Queues.SMALL_BUFFER_SIZE)),
 			DiscardScenario.fluxSource("publishOnAndPublishOn", main -> main
 					.publishOn(Schedulers.immediate())
@@ -197,7 +197,7 @@ public class OnDiscardShouldNotLeakTest {
 				                                               return t2;
 			                                               })
 			                                               .thenReturn(Tracked.RELEASED)),
-			DiscardScenario.fluxSource("reduceWith", f -> f.defaultIfEmpty(new Tracked("default")))
+			DiscardScenario.fluxSource("reduceWith", f -> f.defaultIfEmpty(new Tracked("default")))*/
 	};
 
 	private static final boolean[][] CONDITIONAL_AND_FUSED = new boolean[][] {

@@ -115,42 +115,25 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 		// tracks unsatisfied downstream demand (expressed in # of buffers)
 		volatile long requested;
 		@SuppressWarnings("rawtypes")
-		private AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> REQUESTED =
+		static final AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> REQUESTED =
 				AtomicLongFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "requested");
-
-		// tracks undelivered values in the current buffer
-		volatile int index;
-		@SuppressWarnings("rawtypes")
-		private AtomicIntegerFieldUpdater<BufferTimeoutWithBackpressureSubscriber> INDEX =
-				AtomicIntegerFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "index");
 
 		// tracks # of values requested from upstream but not delivered yet via this
 		// .onNext(v)
 		volatile long outstanding;
 		@SuppressWarnings("rawtypes")
-		private AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> OUTSTANDING =
+		static final AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> OUTSTANDING =
 				AtomicLongFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "outstanding");
 
 		// indicates some thread is draining
-		volatile int wip;
+		volatile long state;
 		@SuppressWarnings("rawtypes")
-		private AtomicIntegerFieldUpdater<BufferTimeoutWithBackpressureSubscriber> WIP =
-				AtomicIntegerFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "wip");
-
-		private volatile int terminated = NOT_TERMINATED;
-		@SuppressWarnings("rawtypes")
-		private AtomicIntegerFieldUpdater<BufferTimeoutWithBackpressureSubscriber> TERMINATED =
-				AtomicIntegerFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "terminated");
-
-		final static int NOT_TERMINATED          = 0;
-		final static int TERMINATED_WITH_SUCCESS = 1;
-		final static int TERMINATED_WITH_ERROR   = 2;
-		final static int TERMINATED_WITH_CANCEL  = 3;
-
+		static final AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> STATE =
+				AtomicLongFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "state");
 		@Nullable
-		private Subscription subscription;
+		Subscription subscription;
 
-		private Queue<T> queue;
+		Queue<T> queue;
 
 		@Nullable
 		Throwable error;
@@ -201,6 +184,8 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			// append to buffer
 			// drain
 
+			mark
+
 			if (terminated == NOT_TERMINATED) {
 				// assume no more deliveries than requested
 				if (!queue.offer(t)) {
@@ -208,8 +193,10 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 					Throwable error = Operators.onOperatorError(this.subscription,
 							Exceptions.failWithOverflow(Exceptions.BACKPRESSURE_ERROR_QUEUE_FULL),
 							t, actual.currentContext());
+
 					this.error = error;
 					if (!TERMINATED.compareAndSet(this, NOT_TERMINATED, TERMINATED_WITH_ERROR)) {
+						Operators.onDiscard(t, ctx);
 						Operators.onErrorDropped(error, ctx);
 						return;
 					}
@@ -238,6 +225,9 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 								Throwable error = Operators.onRejectedExecution(ree, subscription, null, t, ctx);
 								this.error = error;
 								if (!TERMINATED.compareAndSet(this, NOT_TERMINATED, TERMINATED_WITH_ERROR)) {
+									if (logger != null) {
+										trace(logger, "Discarding upon timer rejection" + t);
+									}
 									Operators.onDiscard(t, ctx);
 									Operators.onErrorDropped(error, ctx);
 									return;
@@ -285,12 +275,16 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 
 			// drain (WIP++ ?)
 
+			long previousState = markTerminated(this);
+
+
 			if (currentTimeoutTask != null) {
 				currentTimeoutTask.dispose();
 			}
+
 			timer.dispose();
 
-			if (!TERMINATED.compareAndSet(this, NOT_TERMINATED, TERMINATED_WITH_ERROR)) {
+			if () {
 				Operators.onErrorDropped(t, currentContext());
 				return;
 			}
@@ -326,15 +320,14 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			// drain
 
 			if (Operators.validate(n)) {
-				if (queue.isEmpty() && terminated != NOT_TERMINATED) {
-					return;
-				}
+				Operators.addCap(REQUESTED, this, n);
 
-				if (Operators.addCap(REQUESTED, this, n) == 0) {
-					// there was no demand before - try to fulfill the demand if there
-					// are buffered values
-					drain();
-				}
+				markHasRequests(this);
+
+				// there was no demand before - try to fulfill the demand if there
+				// are buffered values
+				drain();
+
 
 				if (batchSize == Integer.MAX_VALUE || n == Long.MAX_VALUE) {
 					requestMore(Long.MAX_VALUE);
@@ -408,7 +401,7 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 
 			if (WIP.getAndIncrement(this) == 0) {
 				for (;;) {
-					int wip = this.wip;
+					int wip = this.state;
 					if (logger != null) {
 						trace(logger, "drain. wip: " + wip);
 					}
@@ -525,6 +518,44 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			if (key == Attr.RUN_STYLE) return Attr.RunStyle.ASYNC;
 
 			return InnerOperator.super.scanUnsafe(key);
+		}
+
+		static       long FINALIZED_STATE  =
+				0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111L;
+		static       long CANCELLED_FLAG   =
+				0b0100_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000L;
+		static       long TERMINATED_FLAG  =
+				0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000L;
+		static       long WIP_INDEX_MASK   =
+				0b0000_0000_0000_0000_0000_0000_0000_0000_0000_1111_1111_1111_1111_1111_1111_1111L;
+		static final long VALUE_INDEX_MASK =
+				0b0000_0111_1111_1111_1111_1111_1111_1111_1111_0000_0000_0000_0000_0000_0000_0000L;
+
+
+		static long markTerminated(BufferTimeoutWithBackpressureSubscriber<?, ?> instance) {
+			for (;;) {
+				long state = instance.state;
+
+				if (isCancelled(state) || isTerminated(state)) {
+					return state;
+				}
+			}
+		}
+
+		static long markHasValues(BufferTimeoutWithBackpressureSubscriber<?, ?> instance) {
+			for (;;) {
+				long state = instance.state;
+
+
+			}
+		}
+
+		static boolean isTerminated(long state) {
+
+		}
+
+		static boolean isCancelled(long state) {
+
 		}
 	}
 
