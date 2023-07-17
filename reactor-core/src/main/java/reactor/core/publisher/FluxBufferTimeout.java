@@ -23,12 +23,14 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Supplier;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
+import reactor.core.Disposables;
 import reactor.core.Exceptions;
 import reactor.core.scheduler.Scheduler;
 import reactor.util.Logger;
@@ -100,7 +102,7 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 	}
 
 	final static class BufferTimeoutWithBackpressureSubscriber<T, C extends Collection<? super T>>
-			implements InnerOperator<T, C> {
+			implements InnerOperator<T, C>, Runnable {
 
 		@Nullable
 		final Logger                    logger;
@@ -109,21 +111,18 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 		final int prefetch;
 		final long timeSpan;
 		final TimeUnit unit;
-		final Scheduler.Worker timer;
+		final Scheduler timer;
 		final Supplier<C> bufferSupplier;
 
 		// tracks unsatisfied downstream demand (expressed in # of buffers)
+		volatile Disposable currentTimeoutTask;
+		@SuppressWarnings("rawtypes")
+		static final AtomicReferenceFieldUpdater<BufferTimeoutWithBackpressureSubscriber, Disposable> CURRENT_TIMEOUT_TASK =
+				AtomicReferenceFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, Disposable.class, "currentTimeoutTask");
 		volatile long requested;
 		@SuppressWarnings("rawtypes")
 		static final AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> REQUESTED =
 				AtomicLongFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "requested");
-
-		// tracks # of values requested from upstream but not delivered yet via this
-		// .onNext(v)
-		volatile long outstanding;
-		@SuppressWarnings("rawtypes")
-		static final AtomicLongFieldUpdater<BufferTimeoutWithBackpressureSubscriber> OUTSTANDING =
-				AtomicLongFieldUpdater.newUpdater(BufferTimeoutWithBackpressureSubscriber.class, "outstanding");
 
 		// indicates some thread is draining
 		volatile long state;
@@ -138,16 +137,16 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 		@Nullable
 		Throwable error;
 
-		boolean completed;
+		int outstanding;
 
-		Disposable currentTimeoutTask;
+		boolean done;
 
 		public BufferTimeoutWithBackpressureSubscriber(
 				CoreSubscriber<? super C> actual,
 				int batchSize,
 				long timeSpan,
 				TimeUnit unit,
-				Scheduler.Worker timer,
+				Scheduler timer,
 				Supplier<C> bufferSupplier,
 				@Nullable Logger logger) {
 			this.actual = actual;
@@ -178,32 +177,19 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			if (logger != null) {
 				trace(logger, "onNext: " + t);
 			}
-			// check if terminated (cancelled / error / completed) -> discard value if so
 
-			// increment index
-			// append to buffer
-			// drain
 
-			mark
+			if (!queue.offer(t)) {
+				Context ctx = currentContext();
+				Throwable error = Operators.onOperatorError(this.subscription,
+						Exceptions.failWithOverflow(Exceptions.BACKPRESSURE_ERROR_QUEUE_FULL),
+						t, actual.currentContext());
 
-			if (terminated == NOT_TERMINATED) {
-				// assume no more deliveries than requested
-				if (!queue.offer(t)) {
-					Context ctx = currentContext();
-					Throwable error = Operators.onOperatorError(this.subscription,
-							Exceptions.failWithOverflow(Exceptions.BACKPRESSURE_ERROR_QUEUE_FULL),
-							t, actual.currentContext());
+				Operators.onDiscard(t, ctx);
 
-					this.error = error;
-					if (!TERMINATED.compareAndSet(this, NOT_TERMINATED, TERMINATED_WITH_ERROR)) {
-						Operators.onDiscard(t, ctx);
-						Operators.onErrorDropped(error, ctx);
-						return;
-					}
-					Operators.onDiscard(t, ctx);
-					drain();
-					return;
-				}
+				onError(error);
+				return;
+			}
 
 				boolean shouldDrain = false;
 				for (;;) {
@@ -247,16 +233,7 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 					}
 				}
 				if (shouldDrain) {
-					if (currentTimeoutTask != null) {
-						// TODO: it can happen that AFTER I dispose, the timeout
-						//  anyway kicks during/after another onNext(), the buffer is
-						//  delivered, and THEN drain is entered ->
-						//  it would emit a buffer that is too small potentially.
-						//  ALSO:
-						//  It is also possible that here we deliver the buffer, but the
-						//  timeout is happening for a new buffer!
-						currentTimeoutTask.dispose();
-					}
+
 					this.index = 0;
 					drain();
 				}
@@ -270,6 +247,10 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 
 		@Override
 		public void onError(Throwable t) {
+			if (this.done) {
+				Operators.onErrorDropped(t, this.currentContext());
+				return;
+			}
 			// set error flag
 			// set terminated as error
 
@@ -294,6 +275,9 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 
 		@Override
 		public void onComplete() {
+			if (this.done) {
+				return;
+			}
 			// set terminated as completed
 			// drain
 			if (currentTimeoutTask != null) {
@@ -320,24 +304,26 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			// drain
 
 			if (Operators.validate(n)) {
-				Operators.addCap(REQUESTED, this, n);
+				if (Operators.addCap(REQUESTED, this, n) == 0) {
+					long previousState = markHasRequests(this);
 
-				markHasRequests(this);
+					if (hasWorkInProgress(previousState) || hasRequest(previousState)) {
+						return;
+					}
 
-				// there was no demand before - try to fulfill the demand if there
-				// are buffered values
-				drain();
-
-
-				if (batchSize == Integer.MAX_VALUE || n == Long.MAX_VALUE) {
-					requestMore(Long.MAX_VALUE);
-				} else {
-					long requestLimit = prefetch;
-					if (requestLimit > outstanding) {
-						if (logger != null) {
-							trace(logger, "requestMore: " + (requestLimit - outstanding) + ", outstanding: " + outstanding);
+					// there was no demand before - try to fulfill the demand if there
+					// are buffered values
+					if (batchSize == Integer.MAX_VALUE) {
+						requestMore(Long.MAX_VALUE);
+					}
+					else {
+						long requestLimit = prefetch;
+						if (requestLimit > outstanding) {
+							if (logger != null) {
+								trace(logger, "requestMore: " + (requestLimit - outstanding) + ", outstanding: " + outstanding);
+							}
+							requestMore(requestLimit - outstanding);
 						}
-						requestMore(requestLimit - outstanding);
 					}
 				}
 			}
@@ -412,7 +398,7 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 						}
 						// make another spin if there's more work
 					} else {
-						if (completed) {
+						if (done) {
 							// if queue is empty, the discard is ignored
 							if (logger != null) {
 								trace(logger, "Discarding entire queue of " + queue.size());
@@ -434,7 +420,7 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 							// no-op
 						}
 						if (queue.isEmpty()) {
-							completed = true;
+							done = true;
 							if (this.error != null) {
 								actual.onError(this.error);
 							}
@@ -520,23 +506,49 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			return InnerOperator.super.scanUnsafe(key);
 		}
 
-		static       long FINALIZED_STATE  =
+		static final long FINALIZED_STATE  =
 				0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111L;
-		static       long CANCELLED_FLAG   =
+		static final long CANCELLED_FLAG   =
 				0b0100_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000L;
-		static       long TERMINATED_FLAG  =
+		static final long TERMINATED_FLAG  =
 				0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000L;
-		static       long WIP_INDEX_MASK   =
-				0b0000_0000_0000_0000_0000_0000_0000_0000_0000_1111_1111_1111_1111_1111_1111_1111L;
-		static final long VALUE_INDEX_MASK =
-				0b0000_0111_1111_1111_1111_1111_1111_1111_1111_0000_0000_0000_0000_0000_0000_0000L;
+		static final long HAS_REQUEST_FLAG =
+				0b0010_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000L;
+		static final long HAS_VALUES_FLAG =
+				0b0001_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000L;
+		static final long WINDOW_INDEX_MASK =
+				0b0000_1111_1111_1111_1111_1111_1111_1111_1000_0000_0000_0000_0000_0000_0000_0000L;
+		static final long WIP_INDEX_MASK   =
+				0b0000_0000_0000_0000_0000_0000_0000_0000_0111_1111_1111_1111_1111_1111_1111_1111L;
 
+		static final int VALUE_INDEX_SHIFT = 28;
+
+
+		static long markHasRequests(BufferTimeoutWithBackpressureSubscriber<?, ?> instance) {
+			for (;;) {
+				long state = instance.state;
+
+				if (isCancelled(state) || isTerminated(state)) {
+					return state;
+				}
+
+				long nextState = (hasValues(state) || ) | HAS_REQUEST_FLAG;
+
+				if (STATE.compareAndSet(instance, state, )) {
+					return state;
+				}
+			}
+		}
 
 		static long markTerminated(BufferTimeoutWithBackpressureSubscriber<?, ?> instance) {
 			for (;;) {
 				long state = instance.state;
 
 				if (isCancelled(state) || isTerminated(state)) {
+					return state;
+				}
+
+				if (STATE.compareAndSet(instance, state, state | TERMINATED_FLAG)) {
 					return state;
 				}
 			}
@@ -550,12 +562,28 @@ final class FluxBufferTimeout<T, C extends Collection<? super T>> extends Intern
 			}
 		}
 
-		static boolean isTerminated(long state) {
+		static boolean hasWorkInProgress(long state) {
+			return (state & HAS_REQUEST_FLAG) == HAS_REQUEST_FLAG;
+		}
 
+		static boolean hasRequest(long state) {
+			return (state & HAS_REQUEST_FLAG) == HAS_REQUEST_FLAG;
+		}
+
+		static boolean hasValues(long state) {
+			return (state & HAS_VALUES_FLAG) == HAS_VALUES_FLAG;
+		}
+
+		static boolean isTerminated(long state) {
+			return (state & TERMINATED_FLAG) == TERMINATED_FLAG;
 		}
 
 		static boolean isCancelled(long state) {
+			return (state & CANCELLED_FLAG) == CANCELLED_FLAG;
+		}
 
+		static boolean isFinalized(long state) {
+			return state == FINALIZED_STATE;
 		}
 	}
 
